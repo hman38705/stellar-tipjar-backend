@@ -39,7 +39,7 @@ pub fn read_router() -> Router<Arc<AppState>> {
 )]
 pub async fn create_creator(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateCreatorRequest>,
+    ValidatedJson(body): ValidatedJson<CreateCreatorRequest>,
 ) -> impl IntoResponse {
     match creator_controller::create_creator(&state, body).await {
         Ok(creator) => {
