@@ -14,7 +14,6 @@ mod db;
 mod docs;
 mod middleware;
 mod models;
-mod middleware;
 mod routes;
 mod search;
 mod services;
@@ -97,6 +96,8 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .merge(SwaggerUi::new("/swagger-ui")
             .url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .merge(routes::admin::router(Arc::clone(&state)))
+        .merge(routes::export::router(Arc::clone(&state)))
         .merge(write_routes)
         .merge(read_routes)
         .layer(cors)
