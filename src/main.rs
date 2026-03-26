@@ -1,8 +1,9 @@
-use ax_id::HeaderName;
-use axum::{Router, http::{Method, HeaderName as HttpHeaderName}};
+use axum::Router;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
-use std::time::Duration;
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use axum::{http::Method, Router};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -13,28 +14,34 @@ use axum::{http::Method, Router};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
+mod analytics;
 mod cache;
 mod controllers;
+mod cqrs;
 mod db;
 mod docs;
 mod metrics;
 mod email;
 mod errors;
+mod events;
+mod graphql;
 mod logging;
 mod middleware;
 mod models;
 mod routes;
+mod saga;
+mod security;
+mod webhooks;
 mod search;
 mod services;
 mod shutdown;
-mod ws;           // Added from Main
-mod webhooks;     // Added from Main
-mod email;        // Added from Main (Ensure this module exists in your tree)
+mod telemetry;
 mod validation;
 mod ws;
 
 use db::connection::AppState;
 use docs::ApiDoc;
+use graphql::schema::{graphql_handler, graphql_ws_handler};
 use services::stellar_service::StellarService;
 use crate::metrics::metrics_handler;
 use crate::middleware::metrics::track_metrics;
@@ -91,11 +98,11 @@ async fn main() -> anyhow::Result<()> {
         stellar,
         performance,
         redis,
-        tip_service,      // Must be added to AppState struct in next step
-        creator_service,  // Must be added to AppState struct in next step
-        email_sender,     // Must be added to AppState struct in next step
-        broadcast_tx,     // Must be added to AppState struct in next step
+        broadcast_tx,
     });
+
+    // Start the real-time analytics pipeline as a background task.
+    analytics::stream_processor::spawn(Arc::clone(&state));
 
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
@@ -147,16 +154,22 @@ async fn main() -> anyhow::Result<()> {
             ),
     );
 
+    let x_request_id = axum::http::HeaderName::from_static("x-request-id");
+
+    let gql_schema = graphql::schema::build_schema(Arc::clone(&state));
+
     let app = Router::new()
         .route("/ws", axum::routing::get(ws::ws_handler))
-        .route("/metrics", axum::routing::get(metrics_handler))
+        .route("/graphql", axum::routing::post(graphql_handler).get(graphql_ws_handler))
         .merge(SwaggerUi::new("/swagger-ui")
             .url("/api-docs/openapi.json", ApiDoc::openapi()))
         .merge(v1)
         .merge(v2)
-        .layer(axum::middleware::from_fn(track_metrics)) // Your metrics middleware
+        .layer(axum::Extension(gql_schema))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(middleware::tracing::trace_request))
+        .layer(axum::middleware::from_fn(middleware::cache::cache_control))
         .layer(middleware::timeout::timeout_layer_from_env())
         .with_state(state);
 
