@@ -4,6 +4,9 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::services::stellar_service::StellarService;
+use crate::services::tip_service::TipService;
+use crate::services::creator_service::CreatorService;
+use crate::email::sender::EmailSender;
 use crate::ws::TipEvent;
 use super::performance::PerformanceMonitor;
 

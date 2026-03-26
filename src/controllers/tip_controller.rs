@@ -7,7 +7,7 @@ use crate::errors::{AppError, AppResult};
 use crate::models::pagination::{PaginatedResponse, PaginationParams};
 use crate::models::tip::{RecordTipRequest, Tip};
 use crate::cache::{redis_client, keys};
-
+use crate::metrics::collectors::DB_QUERY_DURATION_SECONDS; // Kept from your branch
 use crate::db::transaction;
 
 #[tracing::instrument(skip(state), fields(username = %req.username, amount = %req.amount))]
@@ -17,21 +17,30 @@ pub async fn record_tip(state: &AppState, req: RecordTipRequest) -> AppResult<Ti
         .map_err(AppError::from)?;
 
     let start = Instant::now();
-    let tip = record_tip_in_tx(&mut tx, &req).await?;
+    // Pass state into the internal helper to support WebSocket broadcasting
+    let tip = record_tip_in_tx(state, &mut tx, &req).await?;
     tx.commit().await?;
     let duration = start.elapsed();
 
-    // Log the successful atomic operation
+    // Record your Prometheus metric
+    DB_QUERY_DURATION_SECONDS.observe(duration.as_secs_f64());
+
     QueryLogger::log_query("INSERT tips + tip_logs (transaction)", duration);
     state.performance.track_query("tip_atomic_record", duration);
 
-    // Invalidate the tip list cache for this creator since it's now stale.
+    // Cache invalidation (using our state.redis fix)
     if let Some(conn) = state.redis.as_ref() {
         let mut conn = conn.clone();
         let tips_key = keys::creator_tips(&tip.creator_username);
         let _ = redis_client::del(&mut conn, &[tips_key.as_str()]).await;
     }
 
+    // Main branch added Webhooks
+    crate::webhooks::trigger_webhooks(
+        state.db.clone(),
+        "tip.recorded",
+        serde_json::to_value(&tip).unwrap()
+    ).await;
     // Notify external services via webhook.
     let payload = serde_json::to_value(&tip).map_err(|e| {
         tracing::error!(error = %e, "Failed to serialize tip webhook payload");
@@ -43,8 +52,8 @@ pub async fn record_tip(state: &AppState, req: RecordTipRequest) -> AppResult<Ti
 }
 
 /// Lower-level tip recording that executes within an existing transaction.
-/// This allows for multi-step atomic operations coordinated by a service.
 pub async fn record_tip_in_tx(
+    state: &AppState, // Added state parameter to fix scope issue in Main
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     req: &RecordTipRequest,
 ) -> AppResult<Tip> {
@@ -53,7 +62,7 @@ pub async fn record_tip_in_tx(
         VALUES ($1, $2, $3, $4, NOW())
         RETURNING id, creator_username, amount, transaction_hash, created_at
         "#;
-    
+
     let tip = sqlx::query_as::<_, Tip>(query_tip)
         .bind(Uuid::new_v4())
         .bind(&req.username)
@@ -62,17 +71,26 @@ pub async fn record_tip_in_tx(
         .fetch_one(&mut **tx)
         .await?;
 
-    // Multi-step operation: Add to tip_logs
+    // Log the action in the database
     let query_log = r#"
         INSERT INTO tip_logs (tip_id, creator_username, action)
         VALUES ($1, $2, 'recorded_atomic')
         "#;
-    
+
     sqlx::query(query_log)
         .bind(&tip.id)
         .bind(&tip.creator_username)
         .execute(&mut **tx)
         .await?;
+
+    // Broadcast to WebSocket (Main branch feature)
+    let event = crate::ws::TipEvent {
+        creator_id: tip.creator_username.clone(),
+        tipper_id: req.transaction_hash.clone(),
+        amount: tip.amount.parse::<u64>().unwrap_or(0),
+        timestamp: tip.created_at.timestamp(),
+    };
+    crate::ws::broadcast_tip(&state.broadcast_tx, event).await;
 
     Ok(tip)
 }
@@ -93,11 +111,13 @@ pub async fn get_tips_for_creator(state: &AppState, username: &str) -> AppResult
         .await?;
     let duration = start.elapsed();
 
+    // Record your Prometheus metric
+    DB_QUERY_DURATION_SECONDS.observe(duration.as_secs_f64());
+
     QueryLogger::log_query(query, duration);
     state.performance.track_query(query, duration);
-    tracing::debug!(duration_ms = duration.as_millis(), count = tips.len(), "Tips fetched");
 
-    // Populate cache.
+    // Populate cache
     if let Some(conn) = state.redis.as_ref() {
         let mut conn = conn.clone();
         let cache_key = keys::creator_tips(username);
@@ -107,8 +127,6 @@ pub async fn get_tips_for_creator(state: &AppState, username: &str) -> AppResult
     Ok(tips)
 }
 
-/// Fetch paginated tips for a creator with total count.
-#[tracing::instrument(skip(state), fields(username = %username, page = params.page, limit = params.limit))]
 pub async fn get_tips_paginated(
     state: &AppState,
     username: &str,
@@ -140,12 +158,8 @@ pub async fn get_tips_paginated(
     .await?;
     let duration = start.elapsed();
 
-    tracing::debug!(
-        duration_ms = duration.as_millis(),
-        count = tips.len(),
-        total,
-        "Paginated tips fetched"
-    );
+    // Record your Prometheus metric for paginated queries too
+    DB_QUERY_DURATION_SECONDS.observe(duration.as_secs_f64());
 
     Ok(PaginatedResponse::new(tips, total, &params))
 }

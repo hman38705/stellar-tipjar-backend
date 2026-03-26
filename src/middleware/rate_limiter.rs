@@ -1,62 +1,56 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tower_governor::{
-    governor::{GovernorConfig, GovernorConfigBuilder},
+    governor::GovernorConfigBuilder,
     key_extractor::PeerIpKeyExtractor,
     GovernorLayer,
 };
-use governor::{middleware::StateInformationMiddleware, clock::QuantaInstant};
+// FIXED: This comes from governor, not tower_governor
+use governor::middleware::StateInformationMiddleware;
 
-/// Builds a tuple of (config, layer) for general read endpoints.
-pub fn general_limiter() -> (
-    Arc<GovernorConfig<PeerIpKeyExtractor, StateInformationMiddleware>>, 
-    GovernorLayer<PeerIpKeyExtractor, StateInformationMiddleware>
-) {
+/// Builds a GovernorLayer for general read endpoints.
+/// Configurable via env: RATE_LIMIT_PER_SECOND (default 10), RATE_LIMIT_BURST_SIZE (default 20).
+pub fn general_limiter() -> GovernorLayer<PeerIpKeyExtractor, StateInformationMiddleware> {
     let per_second = env_u64("RATE_LIMIT_PER_SECOND", 10);
     let burst_size = env_u32("RATE_LIMIT_BURST_SIZE", 20);
-    build_config_and_layer(per_second, burst_size)
+    build_layer(per_second, burst_size)
 }
 
-/// Builds a stricter tuple of (config, layer) for write endpoints.
-pub fn write_limiter() -> (
-    Arc<GovernorConfig<PeerIpKeyExtractor, StateInformationMiddleware>>,
-    GovernorLayer<PeerIpKeyExtractor, StateInformationMiddleware>
-) {
+/// Builds a stricter GovernorLayer for write endpoints (POST /tips, POST /creators).
+/// Configurable via env: RATE_LIMIT_WRITE_PER_SECOND (default 2), RATE_LIMIT_WRITE_BURST_SIZE (default 5).
+pub fn write_limiter() -> GovernorLayer<PeerIpKeyExtractor, StateInformationMiddleware> {
     let per_second = env_u64("RATE_LIMIT_WRITE_PER_SECOND", 2);
     let burst_size = env_u32("RATE_LIMIT_WRITE_BURST_SIZE", 5);
-    build_config_and_layer(per_second, burst_size)
+    build_layer(per_second, burst_size)
 }
 
-fn build_config_and_layer(
+fn build_layer(
     per_second: u64,
     burst_size: u32,
-) -> (
-    Arc<GovernorConfig<PeerIpKeyExtractor, StateInformationMiddleware>>,
-    GovernorLayer<PeerIpKeyExtractor, StateInformationMiddleware>
-) {
+) -> GovernorLayer<PeerIpKeyExtractor, StateInformationMiddleware> {
     let config = Arc::new(
         GovernorConfigBuilder::default()
             .per_second(per_second)
             .burst_size(burst_size)
+            .use_headers()
             .finish()
             .unwrap(),
     );
 
-    let layer = GovernorLayer { config: config.clone() };
-    (config, layer)
-}
-
-/// Helper if we manually need to spawn cleanup from config.
-pub fn spawn_cleanup(config: &Arc<GovernorConfig<PeerIpKeyExtractor, StateInformationMiddleware>>) {
+    // Spawn a background task to prune stale entries every 60 seconds internally.
+    // This allows main.rs to stay clean without tracking configs.
     let limiter = config.limiter().clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
-        interval.tick().await; 
+        interval.tick().await; // skip immediate first tick
         loop {
             interval.tick().await;
+            tracing::debug!("rate limiter cleanup: {} tracked IPs", limiter.len());
             limiter.retain_recent();
         }
     });
+
+    GovernorLayer { config }
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {

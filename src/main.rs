@@ -6,8 +6,13 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use axum::{http::Method, Router};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+use tokio::sync::broadcast;
+use axum::{http::Method, Router};
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
 
 mod analytics;
 mod cache;
@@ -15,6 +20,7 @@ mod controllers;
 mod cqrs;
 mod db;
 mod docs;
+mod metrics;
 mod email;
 mod errors;
 mod events;
@@ -37,67 +43,56 @@ use db::connection::AppState;
 use docs::ApiDoc;
 use graphql::schema::{graphql_handler, graphql_ws_handler};
 use services::stellar_service::StellarService;
-use tokio::sync::broadcast;
+use crate::metrics::metrics_handler;
+use crate::middleware::metrics::track_metrics;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     println!("DEBUG: Docker Hot-Reload is working!");
     dotenvy::dotenv().ok();
 
-    // Structured logging — JSON in production, pretty in dev.
-    logging::init();
+    // Stick to the working tracing setup from your branch
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "stellar_tipjar_backend=debug,tower_http=debug".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
-    let database_url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set");
-
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let stellar_rpc_url = std::env::var("STELLAR_RPC_URL")
         .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string());
-
     let stellar_network = std::env::var("STELLAR_NETWORK")
         .unwrap_or_else(|_| "testnet".to_string());
 
-    // --- Database Connectivity ---
-    // Establish a high-performance connection pool to PostgreSQL.
     let pool = PgPoolOptions::new()
         .max_connections(20)
         .min_connections(5)
         .acquire_timeout(Duration::from_secs(3))
-        .idle_timeout(Duration::from_secs(600))
-        .max_lifetime(Duration::from_secs(1800))
         .connect(&database_url)
         .await?;
 
-    // Apply database migrations automatically on startup to keep the schema in sync.
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    // --- Core Services Initialization ---
-    // The StellarService handles all on-chain verification and Horizon API interactions.
+    // --- Services Initialization (Merged from Main) ---
     let stellar = StellarService::new(stellar_rpc_url, stellar_network);
-    
-    // PerformanceMonitor tracks query execution times and system health metrics.
     let performance = Arc::new(db::performance::PerformanceMonitor::new());
     let (broadcast_tx, _) = broadcast::channel(ws::CHANNEL_CAPACITY);
 
-    // Redis provides an optional high-speed caching layer for high-traffic endpoints.
-    let redis_url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    // Redis setup (Your fixed version)
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     let redis = cache::redis_client::connect(&redis_url).await;
-    
-    // --- Async Email Notification Engine ---
-    // We use a background worker pattern with mpsc channels to ensure email 
-    // sending never blocks the critical path of the API.
+
+    // Email Worker (Added from Main)
     let (email_sender, email_rx) = email::sender::EmailSender::new();
     tokio::spawn(email::sender::start_email_worker(email_rx));
     let email_sender = Arc::new(email_sender);
-    
-    // --- Service Layer Orchestration ---
-    // Instantiate our unified services that house global business logic and 
-    // cross-component orchestrations (like sending emails after recording a tip).
-    let tip_service = Arc::new(stellar_tipjar_backend::services::tip_service::TipService::new());
-    let creator_service = Arc::new(stellar_tipjar_backend::services::creator_service::CreatorService::new());
 
-    // --- Global Application State ---
-    // AppState is shared across all request handlers via Axum's State extractor.
+    // Service Layer Orchestration (Added from Main)
+    let tip_service = Arc::new(services::tip_service::TipService::new());
+    let creator_service = Arc::new(services::creator_service::CreatorService::new());
+
     let state = Arc::new(AppState {
         db: pool,
         stellar,
@@ -114,13 +109,13 @@ async fn main() -> anyhow::Result<()> {
         .allow_origin(Any)
         .allow_headers(Any);
 
-    // Build rate limiters and spawn background cleanup tasks for each.
+    // Build rate limiters (Your FIXED version - no tuples!)
     let general_limiter_v1 = middleware::rate_limiter::general_limiter();
     let write_limiter_v1 = middleware::rate_limiter::write_limiter();
     let general_limiter_v2 = middleware::rate_limiter::general_limiter();
     let write_limiter_v2 = middleware::rate_limiter::write_limiter();
 
-    // v1 — deprecated. Injects Deprecation + Sunset headers on every response.
+    // Versioned API Routes (Merged from Main)
     let v1 = Router::new()
         .nest(
             "/api/v1",
@@ -139,9 +134,8 @@ async fn main() -> anyhow::Result<()> {
                         .layer(general_limiter_v1),
                 ),
         )
-        .layer(middleware::from_fn(middleware::deprecation::deprecation_notice));
+        .layer(axum::middleware::from_fn(middleware::deprecation::deprecation_notice));
 
-    // v2 — current stable version, no deprecation headers.
     let v2 = Router::new().nest(
         "/api/v2",
         Router::new()
@@ -182,11 +176,9 @@ async fn main() -> anyhow::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8000".to_string());
     let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!(addr = %addr, "Server listening");
-    tracing::info!(addr = %addr, "Swagger UI available at http://{}/swagger-ui", addr);
+    tracing::info!("Server listening on {}", addr);
 
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
 
-    tracing::info!("Server shut down gracefully");
     Ok(())
 }

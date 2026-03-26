@@ -6,8 +6,7 @@ use crate::db::query_logger::QueryLogger;
 use crate::errors::{AppError, AppResult, ValidationError};
 use crate::models::creator::{CreateCreatorRequest, Creator};
 use crate::search::SearchQuery;
-use crate::cache::{redis_client, keys};
-use sqlx::PgPool;
+use crate::cache::{keys, redis_client};
 
 #[tracing::instrument(skip(state), fields(username = %req.username))]
 pub async fn create_creator(state: &AppState, req: CreateCreatorRequest) -> AppResult<Creator> {
@@ -19,24 +18,30 @@ pub async fn create_creator(state: &AppState, req: CreateCreatorRequest) -> AppR
 
     let start = Instant::now();
     let creator = sqlx::query_as::<_, Creator>(query)
-    .bind(Uuid::new_v4())
-    .bind(&req.username)
-    .bind(&req.wallet_address)
-    .bind(&req.email)
-    .fetch_one(&state.db)
-    .await?;
+        .bind(Uuid::new_v4())
+        .bind(&req.username)
+        .bind(&req.wallet_address)
+        .bind(&req.email) // Main branch added email
+        .fetch_one(&state.db)
+        .await?;
     let duration = start.elapsed();
 
     QueryLogger::log_query(query, duration);
     state.performance.track_query(query, duration);
     tracing::info!(duration_ms = duration.as_millis(), "Creator created");
 
-    // Warm the cache immediately after creation.
+    // Cache the new creator
     if let Some(conn) = state.redis.as_ref() {
         let mut conn = conn.clone();
         let _ = redis_client::set(&mut conn, &keys::creator(&creator.username), &creator, redis_client::TTL_CREATOR).await;
     }
 
+    // Main branch added Webhook notification
+    crate::webhooks::trigger_webhooks(
+        state.db.clone(),
+        "creator.created",
+        serde_json::to_value(&creator).unwrap()
+    ).await;
     // Notify external services via webhook.
     let payload = serde_json::to_value(&creator).map_err(|e| {
         tracing::error!(error = %e, "Failed to serialize creator webhook payload");
@@ -109,7 +114,7 @@ pub async fn search_creators(pool: &PgPool, query: &SearchQuery) -> AppResult<Ve
     )
     .bind(&term)
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(&state.db) // FIXED: Bind to state.db
     .await?;
 
     Ok(creators)

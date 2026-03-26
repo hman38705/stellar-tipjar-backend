@@ -5,6 +5,7 @@ pub mod cache;
 pub mod compression;
 pub mod deprecation;
 pub mod timeout;
+pub mod metrics;
 pub mod rate_limiter;
 pub mod request_id;
 pub mod tracing;
