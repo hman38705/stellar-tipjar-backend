@@ -69,27 +69,6 @@ pub async fn create_creator(
 pub async fn get_creator(
     State(state): State<Arc<AppState>>,
     Path(username): Path<String>,
-) -> impl IntoResponse {
-    // Keep our fixed call: pass &state directly
-    match creator_controller::get_creator_by_username(&state, &username).await {
-        Ok(Some(creator)) => {
-            let response: CreatorResponse = creator.into();
-            (StatusCode::OK, Json(serde_json::json!(response))).into_response()
-        }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "Creator not found" })),
-        )
-            .into_response(),
-        Err(e) => {
-            tracing::error!("Failed to get creator: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "Failed to get creator" })),
-            )
-                .into_response()
-        }
-    }
 ) -> Result<impl IntoResponse, AppError> {
     let creator = creator_controller::get_creator_or_not_found(&state, &username).await?;
     let response: CreatorResponse = creator.into();
@@ -113,24 +92,6 @@ pub async fn get_creator(
 pub async fn get_creator_tips(
     State(state): State<Arc<AppState>>,
     Path(username): Path<String>,
-    Query(params): Query<PaginationParams>, // Added from Main
-) -> impl IntoResponse {
-    // Main branch switched to using a Service for tips.
-    // We follow Main's logic here but pass &state as required by your app structure.
-    match state.tip_service.get_tips_for_creator(&state, &username).await {
-        Ok(tips) => {
-            let response: Vec<TipResponse> = tips.into_iter().map(Into::into).collect();
-            (StatusCode::OK, Json(serde_json::json!(response))).into_response()
-        }
-        Err(e) => {
-            tracing::error!("Failed to get tips: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "Failed to get tips" })),
-            )
-                .into_response()
-        }
-    }
     Query(params): Query<PaginationParams>,
 ) -> Result<impl IntoResponse, AppError> {
     let _ = params;
@@ -176,8 +137,4 @@ pub async fn search_creators(
                 .into_response()
         }
     }
-}
-    let creators = creator_controller::search_creators(&state.db, &query).await?;
-    let response: Vec<CreatorResponse> = creators.into_iter().map(Into::into).collect();
-    Ok((StatusCode::OK, Json(serde_json::json!(response))).into_response())
 }
